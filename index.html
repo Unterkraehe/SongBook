@@ -111,6 +111,10 @@ input,textarea{font:inherit; color:inherit; background:none; border:none; outlin
 .backbtn:hover{color:var(--ink)}
 .backbtn svg{width:16px;height:16px}
 
+@keyframes slideL{from{opacity:0; transform:translateX(30px)} to{opacity:1; transform:none}}
+@keyframes slideR{from{opacity:0; transform:translateX(-30px)} to{opacity:1; transform:none}}
+#view.slide-l{animation:slideL .22s cubic-bezier(.2,.8,.3,1)}
+#view.slide-r{animation:slideR .22s cubic-bezier(.2,.8,.3,1)}
 /* ============ shared bits ============ */
 .eyebrow{
   font-family:var(--font-mono); font-size:.68rem; letter-spacing:.14em; text-transform:uppercase;
@@ -700,6 +704,13 @@ function flushSaves(){
   saveSongDeb.flush();
   saveSongsIdx.flush(); saveIdeasIdx.flush(); savePrefs.flush(); saveRecRefs.flush();
 }
+/* Writes the indexes right now, bypassing the debounce. Deletes and imports must
+   not rely on flush(), which only fires when a write is already pending. */
+async function persistIndexes(){
+  await store.set('meta:songs', JSON.stringify(state.songsIdx));
+  await store.set('meta:ideas', JSON.stringify(state.ideasIdx));
+  await store.set('meta:recrefs', JSON.stringify(recRefs));
+}
 
 async function createSong(){
   const song = {id: uid(), title: 'Untitled song', created: Date.now(), updated: Date.now(),
@@ -708,24 +719,17 @@ async function createSong(){
   touchSongIdx(song);
   openSong(song.id, true);
 }
-async function openSong(id, focusTitle){
+/* Views are history entries, so the device back button walks them (see the router). */
+function openSong(id, focusTitle){ return navTo({v:'song', id, focus: !!focusTitle}); }
+function closeSong(){ navBack({v:'songs'}); }
+async function loadSongInto(id){
   flushSaves();
   const s = await store.get('song:' + id);
-  if (!s){ toast('That song could not be loaded'); return; }
+  if (!s) return false;
   state.song = JSON.parse(s);
   state.songId = id;
   state.view = 'song';
-  render();
-  if (focusTitle){
-    const t = $('.songtitle-input');
-    if (t){ t.focus(); t.select(); }
-  }
-}
-function closeSong(){
-  flushSaves();
-  state.song = null; state.songId = null; state.view = 'songs';
-  player.stop();
-  render();
+  return true;
 }
 
 /* ---------------- ideas: CRUD ---------------- */
@@ -755,8 +759,8 @@ async function removeIdea(id, releaseAudio){
   await store.del('idea:' + id);
   const i = state.ideasIdx.findIndex(x => x.id === id);
   if (i >= 0) state.ideasIdx.splice(i, 1);
-  saveIdeasIdx();
   if (releaseAudio && idea && idea.recId) await releaseRef(idea.recId);
+  await persistIndexes();
   return idea;
 }
 function allTags(){
@@ -904,11 +908,14 @@ async function finishRecording(){
 }
 
 /* ---------------- top-level render ---------------- */
+let pendingDir = null;
 function render(){
   player.stop();
-  closeCtx();
+  hideCtxEl();
   const v = $('#view');
   v.replaceChildren();
+  v.classList.remove('slide-l','slide-r');
+  if (pendingDir){ void v.offsetWidth; v.classList.add(pendingDir === 'left' ? 'slide-l' : 'slide-r'); pendingDir = null; }
   $('#tab-songs').setAttribute('aria-selected', state.view !== 'ideas');
   $('#tab-ideas').setAttribute('aria-selected', state.view === 'ideas');
   if (state.view === 'songs') renderSongs(v);
@@ -1201,6 +1208,7 @@ function openCtx(anchorEvent, items){
       icon(it.icon), it.label));
   }
   m.classList.add('on');
+  pushModal();
   const r = anchorEvent.currentTarget.getBoundingClientRect();
   m.style.top = '0px'; m.style.left = '0px';
   const mw = m.offsetWidth, mh = m.offsetHeight;
@@ -1210,13 +1218,16 @@ function openCtx(anchorEvent, items){
   if (y + mh > window.innerHeight - 8) y = Math.max(8, r.top - mh - 6);
   m.style.left = x + 'px'; m.style.top = y + 'px';
 }
-function closeCtx(){ $('#ctxmenu').classList.remove('on'); }
+function hideCtxEl(){ $('#ctxmenu').classList.remove('on'); }
+function ctxIsOpen(){ return $('#ctxmenu').classList.contains('on'); }
+function closeCtx(){ if (!ctxIsOpen()) return; hideCtxEl(); popModal(); }
 document.addEventListener('pointerdown', e => { if (!$('#ctxmenu').contains(e.target)) closeCtx(); });
 window.addEventListener('resize', closeCtx);
 window.addEventListener('scroll', closeCtx, {passive:true});
 
 /* ---------------- modal sheet ---------------- */
-let sheetCloser = null;
+function hideSheetEl(){ $('#overlay').classList.remove('on'); }
+function sheetIsOpen(){ return $('#overlay').classList.contains('on'); }
 function openSheet(title, buildBody, actions){
   const ov = $('#overlay'), sh = ov.firstElementChild;
   sh.replaceChildren();
@@ -1231,10 +1242,10 @@ function openSheet(title, buildBody, actions){
       actions.map(a => el('button', {class:'btn ' + (a.kind || 'ghost'), onclick: () => a.run()}, a.label))));
   }
   ov.classList.add('on');
-  sheetCloser = () => { ov.classList.remove('on'); sheetCloser = null; };
+  pushModal();
   return body;
 }
-function closeSheet(){ if (sheetCloser) sheetCloser(); }
+function closeSheet(){ if (!sheetIsOpen()) return; hideSheetEl(); popModal(); }
 $('#overlay').addEventListener('pointerdown', e => { if (e.target === $('#overlay')) closeSheet(); });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape'){ closeSheet(); closeCtx(); }
@@ -1277,7 +1288,7 @@ function pickSong(title, cb){
       const items = state.songsIdx.filter(s => !q || (s.title || '').toLowerCase().includes(q))
                                   .sort((a,b) => b.updated - a.updated).slice(0, 80);
       for (const s of items){
-        list.append(el('button', {class:'opt', onclick: () => { closeSheet(); cb(s.id); }},
+        list.append(el('button', {class:'opt', onclick: () => cb(s.id)},
           el('span', null, s.title || 'Untitled song',
             el('span', {class:'sub2'}, s.secCount + ' sections · updated ' + fmtWhen(s.updated)))));
       }
@@ -1330,9 +1341,10 @@ async function deleteSong(song, salvage){
   await store.del('song:' + song.id);
   const i = state.songsIdx.findIndex(x => x.id === song.id);
   if (i >= 0) state.songsIdx.splice(i, 1);
-  saveIdeasIdx.flush(); saveSongsIdx.flush();
-  state.song = null; state.songId = null; state.view = 'songs';
-  render();
+  saveIdeasIdx.flush();
+  await persistIndexes();
+  state.song = null; state.songId = null;
+  navBack({v:'songs'});
 }
 
 function sectionMenu(e, song, sec){
@@ -1454,7 +1466,7 @@ async function assignIdeaFlow(ideaId){
     if (state.song && state.song.id === songId){ song = state.song; }
     else {
       const s = await store.get('song:' + songId);
-      if (!s){ toast('That song could not be loaded'); return; }
+      if (!s){ closeSheet(); toast('That song could not be loaded'); return; }
       song = JSON.parse(s);
     }
     pickSection(song, {title:'Into which section?', allowNew:true}, async sec => {
@@ -1490,7 +1502,7 @@ function sectionFromIdeasFlow(targetSec){
         .filter(x => !q || (x.preview + ' ' + (x.tags||[]).join(' ')).toLowerCase().includes(q))
         .sort((a,b) => b.created - a.created).slice(0, 60);
       for (const x of items){
-        list.append(el('button', {class:'opt', onclick: () => { closeSheet(); chose(x); }},
+        list.append(el('button', {class:'opt', onclick: () => chose(x)},
           el('span', {class:'kindmark'}, icon(x.kind === 'text' ? 'text' : 'music')),
           el('span', {style:'min-width:0'},
             el('span', {style:'display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'}, x.preview || '—'),
@@ -1504,14 +1516,14 @@ function sectionFromIdeasFlow(targetSec){
   });
   async function chose(entry){
     const idea = await loadIdea(entry.id);
-    if (!idea){ toast('That idea could not be loaded'); return; }
+    if (!idea){ closeSheet(); toast('That idea could not be loaded'); return; }
     const finish = async sec => {
       applyIdeaToSection(idea, sec, song.title);
       await removeIdea(idea.id, false);
       songChanged(true);
       toast('Added to ' + sec.title);
     };
-    if (targetSec) finish(targetSec);
+    if (targetSec){ closeSheet(); finish(targetSec); }
     else pickSection(song, {title:'Into which section?', allowNew:true}, finish);
   }
 }
@@ -1691,13 +1703,104 @@ async function importFile(file){
     const ok = await saveAudioB64(recId, d.b64, d.mime || 'audio/webm');
     if (!ok) failedAudio++;
   }
-  saveSongsIdx.flush(); saveIdeasIdx.flush(); saveRecRefs.flush();
+  await persistIndexes();
   state.ideaShown = 0;
   render();
   toast('Imported ' + addedSongs + ' songs and ' + addedIdeas + ' ideas' +
     (skipped ? ' — skipped ' + skipped + ' already here' : '') +
     (failedAudio ? ' — ' + failedAudio + ' recordings missing audio' : ''));
 }
+
+/* ================================================================
+   Navigation: every view is a history entry, so the device back
+   button steps back through the app instead of leaving it.
+   Menus and sheets each hold one shared "modal" entry, so back
+   dismisses them first.
+   ================================================================ */
+let navDepth = 0;        // view entries we pushed ourselves
+let modalEntry = false;  // a menu/sheet currently owns a history entry
+let popExpected = false; // a back() we triggered ourselves
+
+function viewState(){ return state.view === 'song' ? {v:'song', id: state.songId} : {v: state.view}; }
+function pushModal(){
+  if (modalEntry) return;              // chained sheets reuse the one entry
+  modalEntry = true;
+  history.pushState({...viewState(), modal:true}, '');
+}
+function popModal(){
+  if (!modalEntry) return;
+  modalEntry = false; popExpected = true;
+  history.back();
+}
+function navTo(st, replace){
+  if (replace) history.replaceState(st, '');
+  else { history.pushState(st, ''); navDepth++; }
+  return applyState(st);
+}
+function navBack(fallback){
+  if (navDepth > 0) history.back();
+  else navTo(fallback, true);
+}
+function goView(v){
+  if (state.view === v) return;
+  if (state.view === 'song' && v === 'songs') return navBack({v:'songs'});
+  navTo({v});
+}
+const VIEW_ORDER = {songs:0, ideas:1};
+async function applyState(st){
+  st = st || {v:'songs'};
+  const v = st.v || 'songs';
+  const from = state.view;
+  if (v === 'song' && st.id){
+    if (!(await loadSongInto(st.id))){
+      toast('That song is no longer here');
+      return navTo({v:'songs'}, true);
+    }
+    render();
+    if (st.focus){ const t = $('.songtitle-input'); if (t){ t.focus(); t.select(); } }
+    return;
+  }
+  flushSaves();
+  state.song = null; state.songId = null;
+  state.view = (v === 'ideas') ? 'ideas' : 'songs';
+  if (state.view === 'ideas') state.ideaShown = 0;
+  if (VIEW_ORDER[from] != null && from !== state.view)
+    pendingDir = VIEW_ORDER[state.view] > VIEW_ORDER[from] ? 'left' : 'right';
+  render();
+}
+window.addEventListener('popstate', e => {
+  if (popExpected){ popExpected = false; return; }   // our own dismissal — already handled
+  if (modalEntry){                                    // back closes the menu/sheet, nothing else
+    modalEntry = false; hideCtxEl(); hideSheetEl();
+    return;
+  }
+  navDepth = Math.max(0, navDepth - 1);
+  applyState(e.state);
+});
+
+/* ---------------- swipe between Songs and Ideas ---------------- */
+(function(){
+  let x0 = 0, y0 = 0, t0 = 0, tracking = false;
+  const NO_SWIPE = 'input, textarea, .tagrow, .chip, .seg, #recbar, #ctxmenu, .sheet';
+  document.addEventListener('touchstart', e => {
+    tracking = false;
+    if (e.touches.length !== 1) return;
+    if (state.view !== 'songs' && state.view !== 'ideas') return;
+    if (modalEntry || sheetIsOpen() || ctxIsOpen()) return;
+    if (e.target.closest && e.target.closest(NO_SWIPE)) return;
+    const t = e.touches[0];
+    x0 = t.clientX; y0 = t.clientY; t0 = performance.now(); tracking = true;
+  }, {passive:true});
+  document.addEventListener('touchend', e => {
+    if (!tracking) return;
+    tracking = false;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - x0, dy = t.clientY - y0;
+    if (performance.now() - t0 > 700) return;               // a slow drag is not a swipe
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.7) return;  // must be decisively sideways
+    if (dx < 0) goView('ideas'); else goView('songs');
+  }, {passive:true});
+})();
 
 /* ---------------- theme & app menu ---------------- */
 function applyTheme(){
@@ -1730,16 +1833,8 @@ $('#importfile').addEventListener('change', e => {
   e.target.value = '';
   if (f) importFile(f);
 });
-$('#tab-songs').addEventListener('click', () => {
-  if (state.view === 'song') closeSong();
-  else { state.view = 'songs'; render(); }
-});
-$('#tab-ideas').addEventListener('click', () => {
-  if (state.view === 'song') flushSaves();
-  state.song = null; state.songId = null;
-  state.view = 'ideas'; state.ideaShown = 0;
-  render();
-});
+$('#tab-songs').addEventListener('click', () => goView('songs'));
+$('#tab-ideas').addEventListener('click', () => goView('ideas'));
 $('#rec-stop').addEventListener('click', () => stopRecording(true));
 $('#rec-cancel').addEventListener('click', () => stopRecording(false));
 
@@ -1762,7 +1857,10 @@ window.addEventListener('keydown', e => {
     if (r) recRefs = JSON.parse(r) || {};
   }catch(e){ console.error('boot parse', e); }
   applyTheme();
-  render();
+  const h = history.state;
+  const st0 = (h && h.v) ? {v: h.v, id: h.id} : {v:'songs'};
+  history.replaceState(st0, '');
+  await applyState(st0);
 })();
 
 /* ---------------- PWA: offline shell ---------------- */

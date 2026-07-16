@@ -29,6 +29,11 @@ in `sw.js` die Konstante `VERSION` hochzählen (z. B. `songbook-v2`).
   inklusive Audio; der Import fügt nur Neues hinzu und überspringt Duplikate —
   er eignet sich damit auch zum Übertragen/Zusammenführen zwischen Geräten.
 
+## Bedienung unterwegs
+- **Zurück-Taste (Android):** schließt erst offene Menüs/Dialoge, geht dann eine Ansicht
+  zurück (Song → Songliste → …). Erst an der Wurzel verlässt sie die App.
+- **Wischen:** links/rechts wechselt zwischen Songs und Ideen.
+
 ## iOS-Hinweis
 Auf dem iPhone/iPad: in Safari öffnen → Teilen → „Zum Home-Bildschirm". Aufnahmen werden
 dort als AAC (m4a) gespeichert statt Opus/WebM — Import/Export bleibt kompatibel.
