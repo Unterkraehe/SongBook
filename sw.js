@@ -1,5 +1,5 @@
 /* Songbook service worker — offline app shell, cached fonts */
-const VERSION = 'songbook-v2';
+const VERSION = 'songbook-v3';
 const CORE = [
   './', './index.html', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'

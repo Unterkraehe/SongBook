@@ -50,6 +50,8 @@ html[data-theme="dark"]{
 }
 *{box-sizing:border-box; margin:0; -webkit-tap-highlight-color:transparent}
 html,body{height:100%}
+html{overflow-x:clip}
+@supports not (overflow-x:clip){ html{overflow-x:hidden} }
 body{
   background:var(--bg); color:var(--ink);
   font-family:var(--font-ui); font-size:15.5px; line-height:1.5;
@@ -111,8 +113,8 @@ input,textarea{font:inherit; color:inherit; background:none; border:none; outlin
 .backbtn:hover{color:var(--ink)}
 .backbtn svg{width:16px;height:16px}
 
-@keyframes slideL{from{opacity:0; transform:translateX(30px)} to{opacity:1; transform:none}}
-@keyframes slideR{from{opacity:0; transform:translateX(-30px)} to{opacity:1; transform:none}}
+@keyframes slideL{from{opacity:0; transform:translateX(22px)} to{opacity:1; transform:none}}
+@keyframes slideR{from{opacity:0; transform:translateX(-22px)} to{opacity:1; transform:none}}
 #view.slide-l{animation:slideL .22s cubic-bezier(.2,.8,.3,1)}
 #view.slide-r{animation:slideR .22s cubic-bezier(.2,.8,.3,1)}
 /* ============ shared bits ============ */
@@ -563,6 +565,11 @@ const store = {
     if (!this.persistent){ this.mem.delete(k); return; }
     try{ await this._tx('kv', 'readwrite', st => st.delete(k)); }catch(e){ /* already gone */ }
   },
+  async keys(){
+    if (!this.persistent) return [...this.mem.keys()];
+    try{ return await this._tx('kv', 'readonly', st => st.getAllKeys()); }
+    catch(e){ return null; }
+  },
   async putBlob(id, rec){
     if (!this.persistent){ this.memBlobs.set(id, rec); return true; }
     try{ await this._tx('audio', 'readwrite', st => st.put(rec, id)); return true; }
@@ -656,6 +663,20 @@ const saveSongsIdx = debounce(() => store.set('meta:songs', JSON.stringify(state
 const saveIdeasIdx = debounce(() => store.set('meta:ideas', JSON.stringify(state.ideasIdx)), 300);
 const savePrefs   = debounce(() => store.set('meta:prefs', JSON.stringify(state.prefs)), 200);
 
+/* Index entries whose record no longer exists are leftovers from an old bug that
+   failed to persist deletions. Drop them so the list matches what is really stored. */
+async function pruneMissing(){
+  const keys = await store.keys();
+  if (!keys) return 0;
+  const have = new Set(keys);
+  const songs0 = state.songsIdx.length, ideas0 = state.ideasIdx.length;
+  state.songsIdx = state.songsIdx.filter(e => have.has('song:' + e.id));
+  state.ideasIdx = state.ideasIdx.filter(e => have.has('idea:' + e.id));
+  const dropped = (songs0 - state.songsIdx.length) + (ideas0 - state.ideasIdx.length);
+  if (dropped) await persistIndexes();
+  return dropped;
+}
+
 /* ---------------- section spine colors (structure at a glance) ---------------- */
 function spineFor(title){
   const t = (title || '').toLowerCase();
@@ -721,7 +742,7 @@ async function createSong(){
 }
 /* Views are history entries, so the device back button walks them (see the router). */
 function openSong(id, focusTitle){ return navTo({v:'song', id, focus: !!focusTitle}); }
-function closeSong(){ navBack({v:'songs'}); }
+function closeSong(){ goToSongList(); }
 async function loadSongInto(id){
   flushSaves();
   const s = await store.get('song:' + id);
@@ -941,7 +962,7 @@ function renderSongs(v){
   v.append(head);
 
   const ideaCount = state.ideasIdx.length;
-  v.append(el('button', {class:'ideas-banner', onclick: () => { state.view = 'ideas'; render(); }},
+  v.append(el('button', {class:'ideas-banner', onclick: () => goView('ideas')},
     icon('bulb'),
     el('span', null, el('b', null, 'Idea shelf'), ' — phrases, riffs and loose material'),
     el('span', {class:'count'}, ideaCount ? String(ideaCount) : 'empty')));
@@ -972,7 +993,7 @@ function renderSongs(v){
 function renderSongView(){
   const v = $('#view');
   const song = state.song;
-  if (!song){ state.view = 'songs'; render(); return; }
+  if (!song){ navTo({v:'songs'}, true); return; }
   // preserve caret focus loss: full rerender only on structural change (callers guarantee this)
   v.replaceChildren();
 
@@ -1204,7 +1225,7 @@ function openCtx(anchorEvent, items){
   m.replaceChildren();
   for (const it of items){
     if (it === '-'){ m.append(el('hr')); continue; }
-    m.append(el('button', {class: it.danger ? 'danger' : '', onclick: () => { closeCtx(); it.run(); }},
+    m.append(el('button', {class: it.danger ? 'danger' : '', onclick: async () => { await closeCtx(); it.run(); }},
       icon(it.icon), it.label));
   }
   m.classList.add('on');
@@ -1220,7 +1241,7 @@ function openCtx(anchorEvent, items){
 }
 function hideCtxEl(){ $('#ctxmenu').classList.remove('on'); }
 function ctxIsOpen(){ return $('#ctxmenu').classList.contains('on'); }
-function closeCtx(){ if (!ctxIsOpen()) return; hideCtxEl(); popModal(); }
+function closeCtx(){ if (!ctxIsOpen()) return Promise.resolve(); hideCtxEl(); return popModal(); }
 document.addEventListener('pointerdown', e => { if (!$('#ctxmenu').contains(e.target)) closeCtx(); });
 window.addEventListener('resize', closeCtx);
 window.addEventListener('scroll', closeCtx, {passive:true});
@@ -1245,7 +1266,7 @@ function openSheet(title, buildBody, actions){
   pushModal();
   return body;
 }
-function closeSheet(){ if (!sheetIsOpen()) return; hideSheetEl(); popModal(); }
+function closeSheet(){ if (!sheetIsOpen()) return Promise.resolve(); hideSheetEl(); return popModal(); }
 $('#overlay').addEventListener('pointerdown', e => { if (e.target === $('#overlay')) closeSheet(); });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape'){ closeSheet(); closeCtx(); }
@@ -1253,7 +1274,7 @@ document.addEventListener('keydown', e => {
 
 function confirmSheet(title, message, buttons){
   openSheet(title, body => body.append(el('p', {class:'hint', style:'font-size:.92rem'}, message)),
-    buttons.map(b => ({label: b.label, kind: b.kind, run: () => { closeSheet(); if (b.run) b.run(); }})));
+    buttons.map(b => ({label: b.label, kind: b.kind, run: async () => { await closeSheet(); if (b.run) b.run(); }})));
 }
 
 /* ---------------- pickers ---------------- */
@@ -1262,16 +1283,16 @@ function pickSection(song, opts, cb){
     const list = el('div', {class:'optlist'});
     for (const s of song.sections){
       if (opts.excludeId && s.id === opts.excludeId) continue;
-      list.append(el('button', {class:'opt', onclick: () => { closeSheet(); cb(s); }},
+      list.append(el('button', {class:'opt', onclick: async () => { await closeSheet(); cb(s); }},
         el('span', {class:'spine-dot', style:'background:' + spineFor(s.title)}),
         el('span', null, s.title || 'Untitled section',
           el('span', {class:'sub2'}, s.recordings.length + ' takes · ' + (s.lyrics ? 'has lyrics' : 'no lyrics')))));
     }
     if (opts.allowNew){
-      list.append(el('button', {class:'opt subtle', onclick: () => {
+      list.append(el('button', {class:'opt subtle', onclick: async () => {
         const ns = newSection(nextNumberedTitle(song, 'Verse'));
         song.sections.push(ns);
-        closeSheet(); cb(ns);
+        await closeSheet(); cb(ns);
       }}, icon('plus'), 'New section'));
     }
     if (!list.children.length) list.append(el('p', {class:'hint'}, 'This song has no other sections yet.'));
@@ -1344,7 +1365,7 @@ async function deleteSong(song, salvage){
   saveIdeasIdx.flush();
   await persistIndexes();
   state.song = null; state.songId = null;
-  navBack({v:'songs'});
+  goToSongList();
 }
 
 function sectionMenu(e, song, sec){
@@ -1523,7 +1544,7 @@ function sectionFromIdeasFlow(targetSec){
       songChanged(true);
       toast('Added to ' + sec.title);
     };
-    if (targetSec){ closeSheet(); finish(targetSec); }
+    if (targetSec){ await closeSheet(); finish(targetSec); }
     else pickSection(song, {title:'Into which section?', allowNew:true}, finish);
   }
 }
@@ -1717,9 +1738,10 @@ async function importFile(file){
    Menus and sheets each hold one shared "modal" entry, so back
    dismisses them first.
    ================================================================ */
-let navDepth = 0;        // view entries we pushed ourselves
-let modalEntry = false;  // a menu/sheet currently owns a history entry
-let popExpected = false; // a back() we triggered ourselves
+let navStack = [{v:'songs'}]; // mirrors the view entries we pushed, so we always know what is behind us
+let modalEntry = false;       // a menu/sheet currently owns a history entry
+let expectedPops = 0;         // back() calls we made ourselves, still in flight
+let popWaiters = [];
 
 function viewState(){ return state.view === 'song' ? {v:'song', id: state.songId} : {v: state.view}; }
 function pushModal(){
@@ -1727,33 +1749,47 @@ function pushModal(){
   modalEntry = true;
   history.pushState({...viewState(), modal:true}, '');
 }
+/* Resolves once the entry is actually gone, so callers can navigate afterwards
+   without racing the browser's history traversal. */
 function popModal(){
-  if (!modalEntry) return;
-  modalEntry = false; popExpected = true;
-  history.back();
+  if (!modalEntry) return Promise.resolve();
+  modalEntry = false; expectedPops++;
+  return new Promise(res => { popWaiters.push(res); history.back(); });
 }
 function navTo(st, replace){
-  if (replace) history.replaceState(st, '');
-  else { history.pushState(st, ''); navDepth++; }
+  if (replace){ history.replaceState(st, ''); navStack[navStack.length - 1] = st; }
+  else { history.pushState(st, ''); navStack.push(st); }
   return applyState(st);
 }
-function navBack(fallback){
-  if (navDepth > 0) history.back();
-  else navTo(fallback, true);
+/* Going "up" to the song list must land there no matter how the user got here,
+   so we only reuse the back button when the list is provably the entry behind us. */
+function goToSongList(){
+  const prev = navStack[navStack.length - 2];
+  if (prev && prev.v === 'songs') return history.back();
+  if (navStack.length <= 1) return navTo({v:'songs'}, true);
+  return navTo({v:'songs'});
 }
 function goView(v){
   if (state.view === v) return;
-  if (state.view === 'song' && v === 'songs') return navBack({v:'songs'});
+  if (v === 'songs') return goToSongList();
+  const prev = navStack[navStack.length - 2];
+  if (prev && prev.v === v) return history.back();   // natural reverse: don't pile up entries
   navTo({v});
 }
 const VIEW_ORDER = {songs:0, ideas:1};
+let navToken = 0;
 async function applyState(st){
+  const token = ++navToken;          // a newer navigation always wins over a slower older one
   st = st || {v:'songs'};
   const v = st.v || 'songs';
   const from = state.view;
   if (v === 'song' && st.id){
-    if (!(await loadSongInto(st.id))){
-      toast('That song is no longer here');
+    const ok = await loadSongInto(st.id);
+    if (token !== navToken) return;  // the user moved on while the song was loading
+    if (!ok){
+      const i = state.songsIdx.findIndex(x => x.id === st.id);   // self-heal a stale entry
+      if (i >= 0){ state.songsIdx.splice(i, 1); await persistIndexes(); }
+      toast('That song is no longer here — removed from the list');
       return navTo({v:'songs'}, true);
     }
     render();
@@ -1769,12 +1805,16 @@ async function applyState(st){
   render();
 }
 window.addEventListener('popstate', e => {
-  if (popExpected){ popExpected = false; return; }   // our own dismissal — already handled
-  if (modalEntry){                                    // back closes the menu/sheet, nothing else
+  if (expectedPops > 0){                    // our own dismissal — already handled
+    expectedPops--;
+    const w = popWaiters.shift(); if (w) w();
+    return;
+  }
+  if (modalEntry){                          // back closes the menu/sheet, nothing else
     modalEntry = false; hideCtxEl(); hideSheetEl();
     return;
   }
-  navDepth = Math.max(0, navDepth - 1);
+  if (navStack.length > 1) navStack.pop();
   applyState(e.state);
 });
 
@@ -1857,10 +1897,13 @@ window.addEventListener('keydown', e => {
     if (r) recRefs = JSON.parse(r) || {};
   }catch(e){ console.error('boot parse', e); }
   applyTheme();
+  const dropped = await pruneMissing();
   const h = history.state;
   const st0 = (h && h.v) ? {v: h.v, id: h.id} : {v:'songs'};
   history.replaceState(st0, '');
+  navStack = [st0];
   await applyState(st0);
+  if (dropped) toast('Cleaned up ' + dropped + ' item' + (dropped === 1 ? '' : 's') + ' that no longer existed');
 })();
 
 /* ---------------- PWA: offline shell ---------------- */
